@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -266,11 +267,20 @@ def main() -> None:
     parser.add_argument("--version", required=True)
     parser.add_argument("--provider", choices=["openai", "openrouter", "anthropic", "gemini"], required=True)
     parser.add_argument("--model", default=None)
+    parser.add_argument("--case-delay", type=float, default=0.0, help="Seconds between cases to avoid provider rate limits.")
+    parser.add_argument("--case-retries", type=int, default=0, help="Retry provider exceptions for each case before marking provider_error.")
+    parser.add_argument("--retry-delay", type=float, default=0.0, help="Seconds to wait between provider exception retries.")
     parser.add_argument("--system-prompt", type=Path, default=ARTIFACTS_DIR / "system_prompt.md")
     parser.add_argument("--tools", type=Path, default=ARTIFACTS_DIR / "tools.yaml")
     parser.add_argument("--eval-cases", type=Path, default=DATA_DIR / "eval_base.json")
     parser.add_argument("--runs-dir", type=Path, default=ROOT / "runs")
     args = parser.parse_args()
+    if args.case_delay < 0:
+        parser.error("--case-delay must be non-negative")
+    if args.case_retries < 0:
+        parser.error("--case-retries must be non-negative")
+    if args.retry_delay < 0:
+        parser.error("--retry-delay must be non-negative")
 
     system_prompt = args.system_prompt.read_text(encoding="utf-8")
     artifact_version = build_artifact_version(args.version, args.system_prompt, args.tools)
@@ -287,15 +297,24 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     for case in cases:
+        if results and args.case_delay:
+            time.sleep(args.case_delay)
         print(f"Running {case['id']}...", flush=True)
-        agent = HelpdeskAgent(provider, system_prompt=system_prompt, tools=openai_tools, model=args.model)
-        try:
-            tool_choice = None if case["expect"].get("no_tool") else "required"
-            run = agent.run(case_messages(case), tool_choice=tool_choice)
-            calls = [{"name": call.name, "args": call.args} for call in run.tool_calls]
-            result = evaluate_phase_b(case, calls, run.text)
-            tool_results = run.tool_results
-        except Exception as exc:
+        retry_errors: list[str] = []
+        for attempt in range(args.case_retries + 1):
+            agent = HelpdeskAgent(provider, system_prompt=system_prompt, tools=openai_tools, model=args.model)
+            try:
+                tool_choice = None if case["expect"].get("no_tool") else "required"
+                run = agent.run(case_messages(case), tool_choice=tool_choice)
+                calls = [{"name": call.name, "args": call.args} for call in run.tool_calls]
+                result = evaluate_phase_b(case, calls, run.text)
+                tool_results = run.tool_results
+                break
+            except Exception as exc:
+                retry_errors.append(f"attempt {attempt + 1}: {type(exc).__name__}: {str(exc)}")
+                if attempt < args.case_retries and args.retry_delay:
+                    time.sleep(args.retry_delay)
+        else:
             calls = []
             tool_results = []
             result = {
@@ -303,7 +322,7 @@ def main() -> None:
                 "failure_type": "provider_error",
                 "case_failure_type": case.get("failure_type"),
                 "observed_mismatch": "provider_error",
-                "failures": [f"{type(exc).__name__}: {str(exc)}"],
+                "failures": retry_errors,
                 "actual_tool_calls": [],
                 "actual_text": None,
                 "routing_correct": False,
@@ -342,6 +361,9 @@ def main() -> None:
         "suite": args.suite,
         "provider": args.provider,
         "model": selected_model,
+        "case_delay": args.case_delay,
+        "case_retries": args.case_retries,
+        "retry_delay": args.retry_delay,
         "system_prompt": str(args.system_prompt),
         "tools": str(args.tools),
         "eval_cases": str(args.eval_cases),
